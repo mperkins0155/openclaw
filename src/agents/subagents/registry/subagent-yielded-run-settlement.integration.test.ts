@@ -211,9 +211,10 @@ describe("yielded run settlement", () => {
     expect(runSubagentAnnounceFlow).not.toHaveBeenCalled();
   };
 
-  it.each(["done", "missing", "live"] as const)(
+  it.each(["done", "missing", "live", "live-notice"] as const)(
     "settles a restored message wait only when its requester is gone (%s)",
     async (requesterState) => {
+      const live = requesterState === "live" || requesterState === "live-notice";
       const runId = "restored-message-wait";
       const childSessionKey = `agent:main:subagent:${runId}`;
       const requesterSessionKey = "agent:main:message-wait-requester";
@@ -249,7 +250,7 @@ describe("yielded run settlement", () => {
         requesterAgentId: "main",
         requesterDisplayKey: "message-wait-requester",
         task: "Wait for a continuation from the requester",
-        cleanup: requesterState === "live" ? "delete" : "keep",
+        cleanup: live ? "delete" : "keep",
         expectsCompletionMessage: false,
         gatewayContextResolver,
       });
@@ -263,36 +264,35 @@ describe("yielded run settlement", () => {
         hasPendingWork: () => false,
       });
       await mutateSubagentRuns([runId], (rows) => {
-        const current = rows.get(runId)!;
-        const paused = { ...current };
+        const paused = { ...rows.get(runId)! };
         markSubagentRunPausedAfterYield({ entry: paused, endedAt: T0 });
         return { value: undefined, postimages: new Map([[runId, paused]]) };
       });
-      // Hydrate from SQLite under the replacement registry; no old execution or
-      // completion authority can be revived to settle this retained wait.
+      // Restore from SQLite without reviving old execution or completion authority.
       await resetSubagentRegistryForTests({ persist: false });
-      if (requesterState === "live") {
+      if (live) {
         const events = await vi.importActual<typeof import("../../../infra/agent-events.js")>(
           "../../../infra/agent-events.js",
         );
         vi.mocked(onAgentEvent).mockImplementation(events.onAgentEvent);
       }
       await fixture.activateGatewayRuntime();
-      // Give cleanup a successful transport, so an attempted deletion cannot be
-      // hidden by this fixture's deliberately minimal hosted Gateway context.
       const context = getGatewayContextResolver(fixture.gatewayRuntime)!()!;
       context.localEmbedded = true;
       const gatewayRequest = vi.spyOn(gatewayCall, "callGateway").mockResolvedValue({ ok: true });
       const restored = subagentRuns.get(runId)!;
       expect(restored.waitForMessage).toBe(true);
       expect(subagentRuns.isCompletionAuthorityRetired(restored)).toBe(true);
-      if (requesterState === "live") {
+      if (live) {
         expect(
           emitAgentEventIfCurrent({
-            runId: "rejected-queued-input",
+            runId: "unrelated-requester-turn",
             sessionKey: requesterSessionKey,
             stream: "lifecycle",
-            data: { phase: "error", executionStarted: false, error: "Queued input rejected" },
+            data:
+              requesterState === "live-notice"
+                ? { phase: "end", stopReason: "end_turn" }
+                : { phase: "error", executionStarted: false, error: "Queued input rejected" },
           }),
         ).toBe(true);
         await fixture.settle();
@@ -301,7 +301,7 @@ describe("yielded run settlement", () => {
       const result = persisted(runId);
       const session = loadSessionEntry(child);
       expect(session?.activeWriterRunId).toBe(runId);
-      if (requesterState === "live") {
+      if (live) {
         expect(gatewayRequest).not.toHaveBeenCalled();
         expect(result?.archiveAtMs).toBeUndefined();
         expect(result?.pauseReason).toBe("sessions_yield");
